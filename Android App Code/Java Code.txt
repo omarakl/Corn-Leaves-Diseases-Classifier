@@ -1,0 +1,223 @@
+package com.example.app2;
+
+import android.app.AlertDialog;
+import android.content.Intent;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.net.Uri;
+import android.os.Bundle;
+import android.provider.MediaStore;
+import android.util.Log;
+import android.widget.Button;
+import android.widget.ImageView;
+import android.widget.Toast;
+
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
+import androidx.appcompat.app.AppCompatActivity;
+
+import org.tensorflow.lite.Interpreter;
+
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+
+public class MainActivity extends AppCompatActivity {
+
+    private Interpreter tflite;
+    private Interpreter cornLeafModel;
+    private ImageView imageView;
+    private Bitmap selectedImage;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+        getSupportActionBar().hide();
+
+        // Initialize views
+        imageView = findViewById(R.id.imageView);
+        Button uploadButton = findViewById(R.id.uploadButton);
+        Button processButton = findViewById(R.id.processButton);
+
+        // Load the TFLite models
+        try {
+            tflite = new Interpreter(loadModelFile("model.tflite"));
+            cornLeafModel = new Interpreter(loadModelFile("corn.tflite"));
+        } catch (IOException e) {
+            e.printStackTrace();
+            Toast.makeText(this, "Model load failed", Toast.LENGTH_SHORT).show();
+        }
+
+        // Set up button click listeners
+        uploadButton.setOnClickListener(v -> openImageChooser());
+        processButton.setOnClickListener(v -> processImage());
+    }
+
+    // Image chooser activity result
+    private final ActivityResultLauncher<Intent> imagePickerLauncher =
+            registerForActivityResult(new ActivityResultContracts.StartActivityForResult(), result -> {
+                if (result.getResultCode() == RESULT_OK && result.getData() != null) {
+                    Uri imageUri = result.getData().getData();
+                    try {
+                        InputStream inputStream = getContentResolver().openInputStream(imageUri);
+                        selectedImage = BitmapFactory.decodeStream(inputStream);
+                        imageView.setImageBitmap(selectedImage);
+                    } catch (FileNotFoundException e) {
+                        e.printStackTrace();
+                    }
+                }
+            });
+
+    private void openImageChooser() {
+        Intent intent = new Intent(Intent.ACTION_PICK, MediaStore.Images.Media.EXTERNAL_CONTENT_URI);
+        imagePickerLauncher.launch(intent);
+    }
+
+    private void processImage() {
+        if (selectedImage != null) {
+            // Resize image to match model input size (224x224)
+            Bitmap resizedImage = Bitmap.createScaledBitmap(selectedImage, 224, 224, true);
+
+            // Normalize the image pixels
+            float[][] prediction = predict(resizedImage, tflite);
+            String[] classLabels = getClassLabels();  // Get the updated labels
+            int predictedClass = getMaxIndex(prediction[0]);
+
+            String result = classLabels[predictedClass];
+
+            // If the result is one of the valid corn leaf categories, process with the second model
+            if ("Blight".equals(result) || "Common Rust".equals(result) || "Gray Leaf Spot".equals(result) || "Healthy".equals(result)) {
+                processWithCornLeafModel(resizedImage);
+            } else {
+                showPopupDialog("No Corn leaf detected !");
+            }
+        } else {
+            Toast.makeText(this, "Please upload an image", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    // Perform prediction using TFLite model
+    private float[][] predict(Bitmap bitmap, Interpreter model) {
+        ByteBuffer inputBuffer = ByteBuffer.allocateDirect(4 * 224 * 224 * 3);
+        inputBuffer.order(ByteOrder.nativeOrder());
+
+        int[] pixels = new int[224 * 224];
+        bitmap.getPixels(pixels, 0, 224, 0, 0, 224, 224);
+
+        // Normalize pixel values to range [0, 1]
+        for (int pixel : pixels) {
+            inputBuffer.putFloat(((pixel >> 16) & 0xFF) / 255.0f);  // Red channel
+            inputBuffer.putFloat(((pixel >> 8) & 0xFF) / 255.0f);   // Green channel
+            inputBuffer.putFloat((pixel & 0xFF) / 255.0f);          // Blue channel
+        }
+
+        float[][] output = new float[1][38];  // Assuming 38 output labels
+        model.run(inputBuffer, output);
+        return output;
+    }
+
+    // Load the TFLite model from assets
+    private ByteBuffer loadModelFile(String modelName) throws IOException {
+        InputStream is = getAssets().open(modelName);
+        byte[] modelBytes = new byte[is.available()];
+        is.read(modelBytes);
+        is.close();
+        ByteBuffer buffer = ByteBuffer.allocateDirect(modelBytes.length);
+        buffer.put(modelBytes);
+        buffer.rewind();
+        return buffer;
+    }
+
+    private int getMaxIndex(float[] array) {
+        int maxIndex = 0;
+        for (int i = 1; i < array.length; i++) {
+            if (array[i] > array[maxIndex]) maxIndex = i;
+        }
+        return maxIndex;
+    }
+
+    // Define the 38 class labels
+    private String[] getClassLabels() {
+        String[] labels = new String[38];
+        labels[0] = "Blight";
+        labels[1] = "Common Rust";
+        labels[2] = "Gray Leaf Spot";
+        labels[3] = "Healthy";
+        for (int i = 4; i < 38; i++) {
+            labels[i] = "Not Corn " + (i - 3);
+        }
+        return labels;
+    }
+
+    // Process the image with the corn leaf model if valid
+    private void processWithCornLeafModel(Bitmap image) {
+        try {
+            Bitmap resizedImage = Bitmap.createScaledBitmap(image, 224, 224, true);
+            ByteBuffer inputBuffer = ByteBuffer.allocateDirect(4 * 224 * 224 * 3);
+            inputBuffer.order(ByteOrder.nativeOrder());
+
+            int[] pixels = new int[224 * 224];
+            resizedImage.getPixels(pixels, 0, 224, 0, 0, 224, 224);
+
+            for (int pixel : pixels) {
+                inputBuffer.putFloat(((pixel >> 16) & 0xFF) / 255.0f);
+                inputBuffer.putFloat(((pixel >> 8) & 0xFF) / 255.0f);
+                inputBuffer.putFloat((pixel & 0xFF) / 255.0f);
+            }
+
+            float[][] output = new float[1][4]; // Assuming 4 classes for corn leaves
+            cornLeafModel.run(inputBuffer, output);
+
+            String[] classLabels = {"Blight", "Common Rust", "Gray Leaf Spot", "Healthy"};
+
+            // Find the top two predictions
+            int firstMaxIndex = -1, secondMaxIndex = -1;
+            float firstMaxValue = -1, secondMaxValue = -1;
+
+            for (int i = 0; i < output[0].length; i++) {
+                float confidence = output[0][i];
+                if (confidence > firstMaxValue) {
+                    secondMaxValue = firstMaxValue;
+                    secondMaxIndex = firstMaxIndex;
+                    firstMaxValue = confidence;
+                    firstMaxIndex = i;
+                } else if (confidence > secondMaxValue) {
+                    secondMaxValue = confidence;
+                    secondMaxIndex = i;
+                }
+            }
+
+            // Ensure the highest prediction is displayed first
+            StringBuilder resultBuilder = new StringBuilder("Top Predictions:\n\n");
+            resultBuilder.append(classLabels[firstMaxIndex])
+                    .append(": ")
+                    .append(String.format("%.2f", firstMaxValue * 100))
+                    .append("%\n");
+            if (secondMaxIndex != -1) {
+                resultBuilder.append(classLabels[secondMaxIndex])
+                        .append(": ")
+                        .append(String.format("%.2f", secondMaxValue * 100))
+                        .append("%");
+            }
+
+            // Display the top predictions
+            showPopupDialog(resultBuilder.toString());
+
+        } catch (Exception e) {
+            Log.e("ModelError", "Error processing with corn leaf model", e);
+            showPopupDialog("Error processing corn leaf model");
+        }
+    }
+
+    // Show popup dialog with result
+    private void showPopupDialog(String message) {
+        AlertDialog.Builder builder = new AlertDialog.Builder(this);
+        builder.setTitle("Prediction Result");
+        builder.setMessage(message);
+        builder.setPositiveButton("OK", (dialog, which) -> dialog.dismiss());
+        builder.show();
+    }
+}
